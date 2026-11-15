@@ -16,7 +16,7 @@ const call = async (method, body) => {
   const j = await r.json();
   console.log(method, j.ok ? "✓" : j.description);
 };
-await call("setWebhook", { url: `${appUrl}/api/bot`, secret_token: secret, allowed_updates: ["message"] });
+await call("setWebhook", { url: `${appUrl}/api/bot`, secret_token: secret, allowed_updates: ["message", "callback_query"] });
 await call("setChatMenuButton", { menu_button: { type: "web_app", text: "Вишлист", web_app: { url: appUrl } } });
 await call("setMyCommands", { commands: [{ command: "start", description: "Открыть вишлист" }] });
 await call("setMyDescription", {

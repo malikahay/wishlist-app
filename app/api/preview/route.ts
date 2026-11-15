@@ -1,9 +1,14 @@
 import { NextResponse } from "next/server";
 import { scrape } from "@/lib/scrape";
-import { getUser } from "@/lib/telegram";
+import { requireUser, unauthorized } from "@/lib/api";
+import { allowUser, LIMIT_MESSAGE } from "@/lib/limits";
+
+export const maxDuration = 60;
 
 export async function GET(req: Request) {
-  if (!getUser(req)) return NextResponse.json({ error: "unauthorized" }, { status: 401 });
+  const u = await requireUser(req);
+  if (!u) return unauthorized();
+  if (!(await allowUser("preview", u.id))) return NextResponse.json({ error: LIMIT_MESSAGE }, { status: 429 });
   const raw = new URL(req.url).searchParams.get("url") || "";
   try {
     return NextResponse.json(await scrape(raw));

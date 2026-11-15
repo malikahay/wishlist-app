@@ -1,11 +1,11 @@
 import { NextResponse } from "next/server";
-import { forOwner, updateItems, type Item } from "@/lib/db";
+import { addItem, forOwner, getItems, MAX_ITEMS, type Item } from "@/lib/db";
 import { cleanItemInput, requireUser, unauthorized } from "@/lib/api";
 
 export async function POST(req: Request) {
   const u = await requireUser(req);
   if (!u) return unauthorized();
-  const input = cleanItemInput(await req.json());
+  const input = cleanItemInput(await req.json().catch(() => ({})));
   if (!input.url && !input.title && !input.image) {
     return NextResponse.json({ error: "Добавь ссылку или скриншот" }, { status: 400 });
   }
@@ -17,6 +17,8 @@ export async function POST(req: Request) {
     createdAt: Date.now(),
     reservedBy: null,
   };
-  const items = await updateItems(u.id, (list) => [item, ...list].slice(0, 300));
-  return NextResponse.json({ items: forOwner(items) });
+  if (!(await addItem(u.id, item))) {
+    return NextResponse.json({ error: `В вишлисте уже ${MAX_ITEMS} вещей` }, { status: 409 });
+  }
+  return NextResponse.json({ items: forOwner(await getItems(u.id)) });
 }

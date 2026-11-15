@@ -18,6 +18,17 @@ Next.js (App Router) на Vercel · Upstash Redis (Vercel Marketplace) · Telegr
     npm run dev        # вне Telegram используется тестовый пользователь
 Данные локально лежат в `.data/db.json`.
 
+## Безопасность и надёжность
+- Вещи хранятся по одной в Redis-хэше; бронь, правка и добавление — атомарные Lua-скрипты. Бронь идемпотентна (`reserve: true/false`), а не переключатель.
+- Вишлист открывается только по случайному отзываемому токену (`/api/share`), владелец не видит брони даже по своей ссылке.
+- Исходящие запросы по ссылкам пользователей (`lib/net.ts`): проверка IP при подключении (защита от DNS rebinding), проверка каждого редиректа, лимит размера и общий дедлайн.
+- Квоты по пользователю и общий дневной бюджет на распознавание и ScrapingBee, лимит по IP для прокси картинок, серверная проверка размера загрузки.
+- Повторные апдейты Telegram отбрасываются по `update_id`; в продакшене без Redis приложение не стартует.
+
+## Тесты
+    npm test           # парсер цен, суммы по валютам, защита от запросов во внутреннюю сеть
+    npm run typecheck
+
 ## Переменные окружения
 См. `.env.example`.
 
@@ -31,8 +42,10 @@ Next.js (App Router) на Vercel · Upstash Redis (Vercel Marketplace) · Telegr
 | `SCRAPINGBEE_API_KEY` | необязательно: обход защиты от ботов |
 | `ZAI_API_KEY`, `GLM_MODEL` | распознавание скриншотов через GLM |
 | `ANTHROPIC_API_KEY` | необязательно: Claude напрямую вместо AI Gateway |
+| `ADMIN_SECRET` | закрывает `POST /api/setup` (без него эндпоинт отключён) |
+| `LIMIT_*`, `SCRAPINGBEE_DAILY_LIMIT` | необязательно: квоты на распознавание и разбор ссылок (см. `lib/limits.ts`) |
 
 ## Запуск в Telegram
 1. Деплой на Vercel, подключить Upstash Redis, задать переменные выше.
-2. `curl -X POST https://<app>/api/setup` — вебхук, кнопка меню, команды, описание бота.
+2. `curl -X POST -H "x-admin-secret: $ADMIN_SECRET" https://<app>/api/setup` — вебхук, кнопка меню, команды, описание бота (очередь сообщений не сбрасывается).
 3. @BotFather → Bot Settings → Configure Mini App → Enable → тот же URL (нужно для ссылок `t.me/<bot>?startapp=<id>`).

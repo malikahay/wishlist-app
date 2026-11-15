@@ -352,3 +352,8 @@ button, input, textarea { font: inherit; color: inherit; }
 .hint-line { margin: 10px 6px 0; color: var(--muted); font-size: 13px; }
 .card > a:not([href]) { cursor: default; }
 @media (max-width: 640px) { .btn.shot { padding: 11px 14px; } }
+
+.share-group { display: flex; align-items: center; gap: 6px; }
+.icon-btn.reset { width: 38px; height: 38px; background: var(--surface); box-shadow: 0 0 0 1px var(--line); color: var(--muted); }
+.pill:disabled { opacity: .6; cursor: default; }
+.total b + b { margin-top: 2px; }

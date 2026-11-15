@@ -1,4 +1,6 @@
 import * as cheerio from "cheerio";
+import { assertPublicUrl, safeFetch, unsafeCause, UnsafeUrlError } from "./net";
+import { takeGlobal } from "./limits";
 
 export type Preview = {
   url: string;
@@ -10,51 +12,7 @@ export type Preview = {
   description: string | null;
 };
 
-const BROWSER_HEADERS = {
-  "User-Agent":
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36",
-  Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-  "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
-};
-
-/** Blocks obviously internal targets so the server can't be used to probe the local network. */
-export function assertPublicUrl(raw: string): URL {
-  let u: URL;
-  try {
-    u = new URL(raw);
-  } catch {
-    throw new Error("Некорректная ссылка");
-  }
-  if (!["http:", "https:"].includes(u.protocol)) throw new Error("Нужна ссылка http(s)");
-  const h = u.hostname.toLowerCase();
-  if (
-    h === "localhost" ||
-    h.endsWith(".local") ||
-    h.endsWith(".internal") ||
-    /^(127\.|10\.|192\.168\.|169\.254\.|0\.)/.test(h) ||
-    /^172\.(1[6-9]|2\d|3[01])\./.test(h) ||
-    h === "[::1]"
-  ) {
-    throw new Error("Эта ссылка недоступна");
-  }
-  return u;
-}
-
-export async function fetchWithTimeout(url: string, init: RequestInit = {}, ms = 10000) {
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), ms);
-  try {
-    return await fetch(url, {
-      ...init,
-      headers: { ...BROWSER_HEADERS, ...(init.headers || {}) },
-      redirect: "follow",
-      signal: ctrl.signal,
-    });
-  } finally {
-    clearTimeout(t);
-  }
-}
-
+export { assertPublicUrl } from "./net";
 function abs(src: string | undefined | null, base: string): string | null {
   if (!src) return null;
   try {
@@ -209,23 +167,29 @@ export type ScrapeResult = Preview & { partial?: boolean; warning?: string };
 
 type Attempt = { html: string; finalUrl: string } | { error: string; status?: number };
 
-async function direct(url: string): Promise<Attempt> {
+const TOTAL_DEADLINE_MS = 45_000; // whole chain: direct + both ScrapingBee tiers
+
+async function direct(url: string, timeoutMs: number): Promise<Attempt> {
   try {
-    const res = await fetchWithTimeout(url);
+    const res = await safeFetch(url, { timeoutMs: Math.min(timeoutMs, 12_000), maxBytes: 3_000_000 });
     if (!res.ok) return { error: `HTTP ${res.status}`, status: res.status };
-    return { html: (await res.text()).slice(0, 3_000_000), finalUrl: res.url || url };
+    return { html: res.body.toString("utf8"), finalUrl: res.url };
   } catch (e) {
-    return { error: e instanceof Error && e.name === "AbortError" ? "timeout" : "network" };
+    if (unsafeCause(e)) throw new UnsafeUrlError("Эта ссылка недоступна");
+    return { error: e instanceof Error && e.name === "TimeoutError" ? "timeout" : "network" };
   }
 }
 
 /**
  * ScrapingBee renders the page through residential proxies, which gets past most bot walls (Akamai etc).
  * Tier 1 = premium proxy (~10 credits), tier 2 = stealth proxy (~75 credits) for the hardest sites.
+ * Capped by a global daily budget so one user can't burn the account's credits.
  */
-async function viaScrapingBee(url: string, tier: "premium" | "stealth"): Promise<Attempt> {
+async function viaScrapingBee(url: string, tier: "premium" | "stealth", timeoutMs: number): Promise<Attempt> {
   const key = process.env.SCRAPINGBEE_API_KEY;
   if (!key) return { error: "no key" };
+  const budget = Number(process.env.SCRAPINGBEE_DAILY_LIMIT || 200);
+  if (!(await takeGlobal("scrapingbee", budget, 86_400))) return { error: "daily budget exhausted" };
   const q = new URLSearchParams({ api_key: key, url, block_resources: "true" });
   if (tier === "premium") {
     q.set("premium_proxy", "true");
@@ -235,11 +199,7 @@ async function viaScrapingBee(url: string, tier: "premium" | "stealth"): Promise
     q.set("render_js", "true");
   }
   try {
-    const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), 70_000);
-    const res = await fetch(`https://app.scrapingbee.com/api/v1/?${q}`, { signal: ctrl.signal }).finally(() =>
-      clearTimeout(t),
-    );
+    const res = await fetch(`https://app.scrapingbee.com/api/v1/?${q}`, { signal: AbortSignal.timeout(timeoutMs) });
     if (!res.ok) return { error: `scrapingbee ${res.status}`, status: res.status };
     const finalUrl = res.headers.get("spb-resolved-url") || url;
     return { html: (await res.text()).slice(0, 3_000_000), finalUrl };
@@ -258,6 +218,8 @@ export async function scrape(raw: string): Promise<ScrapeResult> {
   const url = target.toString();
   const host = target.hostname.replace(/^www\./, "");
   const slug = titleFromUrl(target);
+  const deadline = Date.now() + TOTAL_DEADLINE_MS;
+  const left = () => deadline - Date.now();
 
   const parse = (a: Attempt): Preview | null => {
     if (!("html" in a)) return null;
@@ -267,10 +229,11 @@ export async function scrape(raw: string): Promise<ScrapeResult> {
     return p;
   };
 
-  let best = parse(await direct(url));
+  let best = parse(await direct(url, left()));
   if (!useful(best) && process.env.SCRAPINGBEE_API_KEY) {
     for (const tier of ["premium", "stealth"] as const) {
-      const p = parse(await viaScrapingBee(url, tier));
+      if (left() < 5_000) break;
+      const p = parse(await viaScrapingBee(url, tier, left()));
       if (p && (!best || useful(p))) best = p;
       if (useful(best)) break;
     }
@@ -289,6 +252,6 @@ export async function scrape(raw: string): Promise<ScrapeResult> {
   return {
     ...base,
     partial: true,
-    warning: `${host} не отдал фото и цену. Впиши цену, а фото — пришли скриншот боту, он подставится сам 📸`,
+    warning: `${host} не отдал фото и цену. Впиши цену, а фото — пришли скриншот, я его распознаю 📸`,
   };
 }

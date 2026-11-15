@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { formatPrice, totalsByCurrency } from "@/lib/price";
 
 type Item = {
   id: string;
@@ -22,7 +23,7 @@ type Draft = Pick<Item, "url" | "title" | "image" | "price" | "currency" | "site
   warning?: string;
 };
 
-type Owner = { id: number; name: string; username?: string; photo?: string };
+type Owner = { name: string };
 
 declare global {
   interface Window {
@@ -32,7 +33,6 @@ declare global {
 
 const BOT = process.env.NEXT_PUBLIC_BOT_USERNAME || "";
 const PASTELS = ["var(--pink)", "var(--mint)", "var(--lavender)", "var(--peach)", "var(--sky)", "var(--butter)"];
-const CURRENCY: Record<string, string> = { RUB: "₽", USD: "$", EUR: "€", GBP: "£", KZT: "₸", UZS: "сум", UAH: "₴" };
 
 const webApp = () => (typeof window !== "undefined" ? window.Telegram?.WebApp : undefined);
 const haptic = (kind: "light" | "success" | "error") => {
@@ -45,22 +45,6 @@ function colorFor(id: string) {
   let h = 0;
   for (const c of id) h = (h * 31 + c.charCodeAt(0)) >>> 0;
   return PASTELS[h % PASTELS.length];
-}
-
-function toNumber(price: string | null): number | null {
-  if (!price) return null;
-  let s = price.replace(/[^\d.,]/g, "");
-  s = s.includes(".") && s.includes(",") ? s.replace(/,/g, "") : s.replace(",", ".");
-  const n = parseFloat(s);
-  return Number.isFinite(n) ? n : null;
-}
-
-function formatPrice(price: string | null, currency: string | null) {
-  if (!price) return null;
-  const n = toNumber(price);
-  const sym = currency ? CURRENCY[currency.toUpperCase()] ?? currency : "";
-  if (n === null) return price;
-  return `${n.toLocaleString("ru-RU", { maximumFractionDigits: 2 })}${sym ? " " + sym : ""}`;
 }
 
 const imgSrc = (url: string | null) => (url ? `/api/image?url=${encodeURIComponent(url)}` : null);
@@ -89,7 +73,7 @@ async function api<T = any>(path: string, init: RequestInit = {}): Promise<T> {
 export default function Home() {
   const [me, setMe] = useState<{ id: number; name: string } | null>(null);
   const [items, setItems] = useState<Item[]>([]);
-  const [guest, setGuest] = useState<{ owner: Owner; items: Item[] } | null>(null);
+  const [guest, setGuest] = useState<{ token: string; owner: Owner; items: Item[] } | null>(null);
   const [status, setStatus] = useState<"loading" | "ready" | "outside">("loading");
   const [link, setLink] = useState("");
   const [fetching, setFetching] = useState(false);
@@ -98,6 +82,14 @@ export default function Home() {
   const [draft, setDraft] = useState<Draft | null>(null);
   const [filter, setFilter] = useState<"wish" | "done">("wish");
   const [toast, setToast] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [busyIds, setBusyIds] = useState<Set<string>>(new Set());
+  const setBusy = (id: string, on: boolean) =>
+    setBusyIds((prev) => {
+      const next = new Set(prev);
+      on ? next.add(id) : next.delete(id);
+      return next;
+    });
 
   const flash = (t: string) => {
     setToast(t);
@@ -124,8 +116,13 @@ export default function Home() {
         const data = await api("/api/me");
         setMe(data.user);
         setItems(data.items);
-        if (startParam && /^\d+$/.test(startParam) && Number(startParam) !== data.user.id) {
-          setGuest(await api(`/api/lists/${startParam}`));
+        if (startParam && /^[\w-]{10,40}$/.test(startParam)) {
+          try {
+            const list = await api(`/api/lists/${startParam}`);
+            if (!list.own) setGuest({ token: startParam, ...list });
+          } catch (e: any) {
+            setError(e.message);
+          }
         }
         setStatus("ready");
       } catch (e: any) {
@@ -183,8 +180,12 @@ export default function Home() {
     }
   }
 
+  const savingRef = useRef(false);
   const save = useCallback(async () => {
-    if (!draft) return;
+    if (!draft || savingRef.current) return; // no double submits
+    savingRef.current = true;
+    setSaving(true);
+    webApp()?.MainButton?.showProgress?.();
     const { editingId, warning, ...fields } = draft;
     try {
       const data = editingId
@@ -200,30 +201,64 @@ export default function Home() {
     } catch (e: any) {
       setError(e.message);
       haptic("error");
+    } finally {
+      savingRef.current = false;
+      setSaving(false);
+      webApp()?.MainButton?.hideProgress?.();
     }
   }, [draft]);
 
-  async function toggleDone(item: Item) {
+  /** Optimistic update with rollback and a visible error if the server says no. */
+  async function optimistic(item: Item, apply: (list: Item[]) => Item[], request: () => Promise<any>, failText: string) {
+    if (busyIds.has(item.id)) return;
+    setBusy(item.id, true);
+    const before = items;
+    setItems(apply);
+    try {
+      const data = await request();
+      setItems(data.items);
+    } catch (e: any) {
+      setItems(before);
+      haptic("error");
+      flash(e.message && e.message !== "Ошибка" ? e.message : failText);
+    } finally {
+      setBusy(item.id, false);
+    }
+  }
+
+  function toggleDone(item: Item) {
     haptic("light");
-    setItems((p) => p.map((i) => (i.id === item.id ? { ...i, done: !i.done } : i)));
-    const data = await api(`/api/items/${item.id}`, { method: "PATCH", body: JSON.stringify({ done: !item.done }) });
-    setItems(data.items);
+    optimistic(
+      item,
+      (p) => p.map((i) => (i.id === item.id ? { ...i, done: !item.done } : i)),
+      () => api(`/api/items/${item.id}`, { method: "PATCH", body: JSON.stringify({ done: !item.done }) }),
+      "Не удалось сохранить — попробуй ещё раз",
+    );
   }
 
   function remove(item: Item) {
-    const run = async () => {
-      setItems((p) => p.filter((i) => i.id !== item.id));
-      const data = await api(`/api/items/${item.id}`, { method: "DELETE" });
-      setItems(data.items);
-    };
+    const run = () =>
+      optimistic(
+        item,
+        (p) => p.filter((i) => i.id !== item.id),
+        () => api(`/api/items/${item.id}`, { method: "DELETE" }),
+        "Не удалось удалить — попробуй ещё раз",
+      );
     const tg = webApp();
     if (tg?.showConfirm && tg.initData) tg.showConfirm(`Удалить «${item.title}»?`, (ok: boolean) => ok && run());
     else if (confirm(`Удалить «${item.title}»?`)) run();
   }
 
-  function share() {
+  async function share() {
     if (!me) return;
-    const url = BOT ? `https://t.me/${BOT}?startapp=${me.id}` : `${location.origin}/?startapp=${me.id}`;
+    let token: string;
+    try {
+      token = (await api("/api/share")).token;
+    } catch (e: any) {
+      flash(e.message);
+      return;
+    }
+    const url = BOT ? `https://t.me/${BOT}?startapp=${token}` : `${location.origin}/?startapp=${token}`;
     const tg = webApp();
     if (tg?.initData) {
       tg.openTelegramLink(
@@ -235,20 +270,42 @@ export default function Home() {
     }
   }
 
+  /** Revokes the old share link: anyone holding it loses access. */
+  function resetShare() {
+    const run = async () => {
+      try {
+        await api("/api/share", { method: "POST" });
+        flash("Старая ссылка больше не работает ✓");
+      } catch (e: any) {
+        flash(e.message);
+      }
+    };
+    const tg = webApp();
+    const q = "Сбросить ссылку на вишлист? Те, у кого старая ссылка, потеряют доступ.";
+    if (tg?.showConfirm && tg.initData) tg.showConfirm(q, (ok: boolean) => ok && run());
+    else if (confirm(q)) run();
+  }
+
   // ---------- guest actions ----------
-  async function reserve(item: Item) {
-    if (!guest) return;
+  async function reserve(item: Item, want: boolean) {
+    if (!guest || busyIds.has(item.id)) return;
+    setBusy(item.id, true);
     try {
-      const data = await api(`/api/lists/${guest.owner.id}/reserve`, {
+      const res = await fetch(`/api/lists/${guest.token}/reserve`, {
         method: "POST",
-        body: JSON.stringify({ itemId: item.id }),
+        headers: { "Content-Type": "application/json", Authorization: `tma ${webApp()?.initData || ""}` },
+        body: JSON.stringify({ itemId: item.id, reserve: want }),
       });
-      setGuest({ ...guest, items: data.items });
+      const data = await res.json().catch(() => ({}));
+      if (data.items) setGuest((g) => (g ? { ...g, items: data.items } : g));
+      if (!res.ok) throw new Error(data.error || "Не получилось — попробуй ещё раз");
       haptic("success");
-      flash(item.reservedByMe ? "Бронь снята" : "Забронировано — это секрет 🤫");
+      flash(want ? "Забронировано — это секрет 🤫" : "Бронь снята");
     } catch (e: any) {
       haptic("error");
       flash(e.message);
+    } finally {
+      setBusy(item.id, false);
     }
   }
 
@@ -287,9 +344,7 @@ export default function Home() {
 
   const total = useMemo(() => {
     const open = items.filter((i) => !i.done);
-    const sum = open.reduce((s, i) => s + (toNumber(i.price) ?? 0), 0);
-    const cur = open.find((i) => i.currency)?.currency ?? null;
-    return { count: open.length, sum: sum ? formatPrice(String(sum), cur) : null };
+    return { count: open.length, sums: totalsByCurrency(open) };
   }, [items]);
 
   // ---------- render ----------
@@ -347,13 +402,13 @@ export default function Home() {
                 item={item}
                 cta={
                   item.reservedByMe ? (
-                  <button className="pill mine" onClick={() => reserve(item)}>
+                  <button className="pill mine" disabled={busyIds.has(item.id)} onClick={() => reserve(item, false)}>
                     Ты даришь ✓
                   </button>
                 ) : item.reserved ? (
                   <span className="pill taken">Уже дарят</span>
                 ) : (
-                  <button className="pill" onClick={() => reserve(item)}>
+                  <button className="pill" disabled={busyIds.has(item.id)} onClick={() => reserve(item, true)}>
                     Подарю
                   </button>
                 )
@@ -380,12 +435,19 @@ export default function Home() {
           {total.count > 0 && (
             <div className="total">
               {total.count} {plural(total.count, ["желание", "желания", "желаний"])}
-              {total.sum && <b>≈ {total.sum}</b>}
+              {total.sums.map((s) => (
+                <b key={s}>≈ {s}</b>
+              ))}
             </div>
           )}
-          <button className="btn share" onClick={share}>
-            Поделиться
-          </button>
+          <div className="share-group">
+            <button className="btn share" onClick={share}>
+              Поделиться
+            </button>
+            <button className="icon-btn reset" title="Сбросить ссылку" onClick={resetShare}>
+              ↻
+            </button>
+          </div>
         </div>
       </header>
 
@@ -492,8 +554,8 @@ export default function Home() {
                 <button type="button" className="btn ghost" onClick={() => setDraft(null)}>
                   Отмена
                 </button>
-                <button type="button" className="btn" onClick={save}>
-                  Сохранить
+                <button type="button" className="btn" onClick={save} disabled={saving}>
+                  {saving ? <span className="spinner" /> : "Сохранить"}
                 </button>
               </div>
             )}

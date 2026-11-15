@@ -35,6 +35,9 @@ export type ScreenshotResult = {
   image: string | null; // "img:<id>" stored crop
 };
 
+export const MAX_UPLOAD_BYTES = 6_000_000;
+const MAX_INPUT_PIXELS = 40_000_000; // e.g. 6000×6600 — guards against decompression bombs
+const TOTAL_DEADLINE_MS = 75_000; // GLM attempts + Claude fallback together
 const MAX_SIDE = 1568; // larger images get downscaled by the API anyway; keeps coordinates in our own pixel space
 
 async function client() {
@@ -56,7 +59,7 @@ const PROMPT = (w: number, h: number) =>
   "excluding UI text, prices, buttons, and thumbnails.";
 
 /** Claude Opus 5.5 — directly with ANTHROPIC_API_KEY, otherwise via Vercel AI Gateway (OIDC). Box in pixels. */
-async function extractWithClaude(jpeg: Buffer, w: number, h: number): Promise<Extracted | null> {
+async function extractWithClaude(jpeg: Buffer, w: number, h: number, timeoutMs: number): Promise<Extracted | null> {
   const { c, model } = await client();
   const res = await c.messages.parse({
     model,
@@ -71,7 +74,7 @@ async function extractWithClaude(jpeg: Buffer, w: number, h: number): Promise<Ex
         ],
       },
     ],
-  });
+  }, { timeout: timeoutMs, maxRetries: 0 });
   if (res.stop_reason === "refusal") return null;
   return res.parsed_output ?? null;
 }
@@ -80,7 +83,7 @@ async function extractWithClaude(jpeg: Buffer, w: number, h: number): Promise<Ex
  * GLM vision via Z.ai (OpenAI-compatible). It returns boxes as [xmin,ymin,xmax,ymax]; the docs don't state the
  * scale, so we ask for 0–1000 and also accept pixels if every value fits the image but some exceed 1000.
  */
-async function extractWithGlm(jpeg: Buffer, w: number, h: number): Promise<Extracted | null> {
+async function extractWithGlm(jpeg: Buffer, w: number, h: number, deadline: number): Promise<Extracted | null> {
   const prompt =
     PROMPT(w, h) +
     "\n\nAnswer with ONLY a JSON object, no markdown, with keys: " +
@@ -108,7 +111,7 @@ async function extractWithGlm(jpeg: Buffer, w: number, h: number): Promise<Extra
         },
       ],
     }),
-    signal: AbortSignal.timeout(60_000),
+    signal: AbortSignal.timeout(Math.max(1_000, deadline - Date.now())),
   });
   // thinking off is faster; if this model doesn't allow it, retry with its default
   // free flash model first, paid one if it isn't available on this account
@@ -163,18 +166,22 @@ async function extractWithGlm(jpeg: Buffer, w: number, h: number): Promise<Extra
 }
 
 async function extract(jpeg: Buffer, w: number, h: number): Promise<Extracted | null> {
+  const deadline = Date.now() + TOTAL_DEADLINE_MS;
   if (process.env.ZAI_API_KEY) {
     try {
-      return await extractWithGlm(jpeg, w, h);
+      return await extractWithGlm(jpeg, w, h, deadline - 20_000);
     } catch (e) {
       console.error("glm failed, falling back to Claude", e);
     }
   }
-  return extractWithClaude(jpeg, w, h);
+  const left = deadline - Date.now();
+  if (left < 8_000) throw new Error("screenshot deadline exceeded");
+  return extractWithClaude(jpeg, w, h, left);
 }
 
 export async function analyzeScreenshot(input: Buffer): Promise<ScreenshotResult | null> {
-  const base = sharp(input, { failOn: "none" }).rotate();
+  if (input.byteLength > MAX_UPLOAD_BYTES) throw new Error("image too large");
+  const base = sharp(input, { failOn: "error", limitInputPixels: MAX_INPUT_PIXELS }).rotate();
   const { data: jpeg, info } = await base
     .clone()
     .resize({ width: MAX_SIDE, height: MAX_SIDE, fit: "inside", withoutEnlargement: true })
